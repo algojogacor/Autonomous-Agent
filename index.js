@@ -170,7 +170,7 @@ async function main() {
       }
 
       // Preference correction: "correct library axios → got"
-      const correctMatch = t.match(/^correct\s+(\w+)\s+(.+?)\s*[→->]+\s*(.+)$/i);
+      const correctMatch = t.match(/^correct\s+(\w+)\s+(.+?)\s*(?:→|->|>)\s*(.+)$/i);
       if (correctMatch) {
         const [, category, original, correction] = correctMatch;
         const { logCorrection } = await import("./memory/preferences.js");

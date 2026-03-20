@@ -1,0 +1,19 @@
+{
+  "name": "autonomous-agent",
+  "version": "3.0.0",
+  "description": "Hardware-optimized autonomous multi-agent system — 100% free, runs on Ollama",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start":   "node index.js",
+    "dev":     "node --watch index.js",
+    "install-gpu": "npm install sharp tesseract.js"
+  },
+  "dependencies": {
+    "sharp":       "^0.33.0",
+    "tesseract.js": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

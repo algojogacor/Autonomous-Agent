@@ -1,141 +1,95 @@
 // core/uncertainty.js — Uncertainty Scoring & Human-in-the-Loop
-// Implements confidence thresholds for destructive or risky operations.
-// Industrial-grade agents know when to ask for help.
-import { callOllama }   from "../agents/base.js";
-import { MODELS, AGENT } from "../config.js";
+// FIXED: Only gates on genuinely destructive actions.
+// Safe operations (read, search, list) NEVER trigger a gate.
 import { logCorrection } from "../memory/preferences.js";
 
-// ── Destructive pattern detection ────────────────────
+// ── Truly destructive patterns ONLY ─────────────────
+// These always require explicit user confirmation before running.
 const DESTRUCTIVE_PATTERNS = [
-  /rm\s+-rf/i,
-  /git\s+(push\s+--force|reset\s+--hard|clean\s+-fd)/i,
-  /drop\s+(database|table|collection)/i,
-  /delete\s+from.*where/i,
-  /format\s+[a-z]:/i,             // format drive
-  /mkfs/i,
-  /dd\s+if=/i,
-  /truncate/i,
-  /forever\s+stopall/i,
-  /pkill\s+-9/i,
-  /taskkill.*\/f/i,
-  /reg\s+delete/i,
-  /netsh.*reset/i,
+  /\brm\s+-rf\b/i,
+  /\brd\s+\/s\s+\/q\b/i,               // Windows: rd /s /q
+  /Remove-Item.*-Recurse.*-Force/i,     // PowerShell delete
+  /git\s+(push\s+--force|reset\s+--hard)/i,
+  /drop\s+(database|table|collection)\b/i,
+  /\bformat\s+[a-z]:\b/i,
+  /\bmkfs\b/i,
+  /\bdd\s+if=/i,
+  /\bsend.*email\b/i,
+  /\bsmtp\b/i,
 ];
 
-const SENSITIVE_PATTERNS = [
-  /password|passwd|secret|api.?key|token|credential/i,
-  /\.env/i,
-  /ssh\s+.*@/i,
-  /curl.*-d.*password/i,
-  /send.*email|smtp/i,
-  /payment|billing|charge/i,
-];
+// ── Safe tool names — NEVER gate these ───────────────
+const ALWAYS_SAFE_TOOLS = new Set([
+  "list_directory",
+  "read_file",
+  "web_search",
+  "fetch_url",
+  "recall_memory",
+  "query_knowledge",
+  "save_progress",
+  "learn_fact",
+  "take_screenshot",
+  "mouse_move",
+  "audit_plan",
+]);
 
 /**
- * Classify risk level of a planned action.
- * @returns {{ level: 'safe'|'sensitive'|'destructive', reason: string }}
+ * Classify risk level of an action string.
  */
-export function classifyRisk(actionDescription) {
+export function classifyRisk(action) {
   for (const p of DESTRUCTIVE_PATTERNS) {
-    if (p.test(actionDescription)) {
-      return { level: "destructive", reason: `Matches destructive pattern: ${p}` };
-    }
-  }
-  for (const p of SENSITIVE_PATTERNS) {
-    if (p.test(actionDescription)) {
-      return { level: "sensitive", reason: `Involves sensitive data: ${p}` };
+    if (p.test(action)) {
+      return { level: "destructive", reason: `Destructive pattern detected: ${p.source}` };
     }
   }
   return { level: "safe", reason: "" };
 }
 
 /**
- * Ask the model to score its own confidence (0.0–1.0) on a task.
- * If below AGENT.uncertaintyThreshold, pause for human validation.
+ * Confidence gate — ONLY blocks on genuinely destructive actions.
+ * Safe tools and normal operations pass through instantly with no LLM call.
  */
-export async function scoreConfidence(task, planSoFar = "") {
-  const prompt = `Rate your confidence in completing this task successfully.
-  
-TASK: ${task}
-${planSoFar ? `CURRENT PLAN:\n${planSoFar}` : ""}
-
-Consider: complexity, ambiguity, risk of irreversible mistakes, missing information.
-
-Respond ONLY in JSON:
-{ "confidence": 0.0-1.0, "reason": "one sentence", "blockers": ["blocker1"] }`;
-
-  try {
-    const resp = await callOllama(MODELS.fast, [
-      { role: "system", content: "You are a precise confidence estimator. JSON only." },
-      { role: "user",   content: prompt },
-    ]);
-    const text = resp.choices?.[0]?.message?.content || "{}";
-    const json = JSON.parse(text.replace(/```json|```/g, "").trim());
-    return {
-      confidence: Math.min(1, Math.max(0, json.confidence ?? 0.8)),
-      reason:     json.reason || "",
-      blockers:   json.blockers || [],
-    };
-  } catch {
-    return { confidence: 0.8, reason: "Could not assess", blockers: [] };
+export async function confidenceGate({ action, task, toolName, rl, log, C }) {
+  // Always-safe tools: instant pass
+  if (toolName && ALWAYS_SAFE_TOOLS.has(toolName)) {
+    return { proceed: true };
   }
-}
 
-/**
- * Gate: Check confidence + risk before proceeding.
- * If risky or low confidence → ask user.
- * Returns { proceed: bool, userResponse?: string }
- */
-export async function confidenceGate({ action, task, rl, log, C }) {
-  if (!AGENT.destructiveConfirm) return { proceed: true };
+  // Write/patch files: safe, pass through
+  if (toolName === "write_file" || toolName === "patch_file") {
+    return { proceed: true };
+  }
 
-  const risk = classifyRisk(action);
+  // API calls: safe
+  if (toolName === "call_api") {
+    return { proceed: true };
+  }
 
-  // Always ask for destructive actions
-  if (risk.level === "destructive") {
-    log(`\n⚠️  DESTRUCTIVE ACTION DETECTED`, C.red);
-    log(`   Action: ${action.slice(0, 100)}`, C.yellow);
-    log(`   Reason: ${risk.reason}`, C.yellow);
+  // mouse_click and keyboard: pass through (Vision agent already verified coords)
+  if (toolName === "mouse_click" || toolName === "keyboard_type" || toolName === "mouse_scroll") {
+    return { proceed: true };
+  }
 
-    const answer = await new Promise(r =>
-      rl.question(`${C.red}${C.bold}Confirm this action? (yes/no): ${C.reset}`, r)
-    );
-    if (!answer.toLowerCase().startsWith("y")) {
-      return { proceed: false, reason: "User rejected destructive action" };
+  // For bash commands: only gate on truly destructive patterns
+  if (toolName === "execute_bash" || toolName === "execute_bash_parallel") {
+    const risk = classifyRisk(action);
+    if (risk.level === "destructive") {
+      log(`\n⚠️  DESTRUCTIVE COMMAND DETECTED`, C.red);
+      log(`   ${action.slice(0, 120)}`, C.yellow);
+      const answer = await new Promise(r =>
+        rl.question(`${C.red}${C.bold}Confirm? (yes/no): ${C.reset}`, r)
+      );
+      if (!answer.toLowerCase().startsWith("y")) {
+        return { proceed: false, reason: "User rejected destructive command" };
+      }
     }
     return { proceed: true };
   }
 
-  // Score confidence for complex tasks
-  const { confidence, reason, blockers } = await scoreConfidence(task, action);
-
-  if (confidence < AGENT.uncertaintyThreshold) {
-    log(`\n❓ Low confidence: ${(confidence * 100).toFixed(0)}% — ${reason}`, C.yellow);
-    if (blockers.length) {
-      log(`   Blockers: ${blockers.join(", ")}`, C.gray);
-    }
-
-    const answer = await new Promise(r =>
-      rl.question(
-        `${C.cyan}Agent is ${(confidence * 100).toFixed(0)}% confident. Proceed anyway? (yes/no/details): ${C.reset}`,
-        r
-      )
-    );
-
-    if (answer.toLowerCase().startsWith("d")) {
-      return { proceed: false, reason: "User requested more details", needsInfo: true };
-    }
-    if (!answer.toLowerCase().startsWith("y")) {
-      return { proceed: false, reason: "User paused low-confidence action" };
-    }
-  }
-
-  return { proceed: true, confidence, risk };
+  // Everything else: proceed
+  return { proceed: true };
 }
 
-/**
- * Log a user correction to the preference system.
- */
 export function recordCorrection(category, original, correction) {
   logCorrection(category, original, correction);
 }

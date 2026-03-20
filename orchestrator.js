@@ -1,196 +1,108 @@
-// orchestrator.js — 🎯 The Manager (minimax-m2.7:cloud)
-// Full hardware-aware orchestration with:
-//   - ReAct loop
-//   - Self-correction + RCA
-//   - Adversarial debate routing
-//   - Memory retrieval
-//   - Confidence gating
-//   - All 7 specialized agents
-import { MODELS, WORKING_DIR }     from "./config.js";
-import { TOOLS_ALL, EXECUTORS }    from "./tools/index.js";
-import { callOllama }              from "./agents/base.js";
-import { analyze  as visionRun }   from "./agents/vision.js";
-import { code     as coderRun }    from "./agents/coder.js";
-import { reason   as logicRun }    from "./agents/logic.js";
-import { audit    as securityRun } from "./agents/security.js";
-import { analyze  as perfRun }     from "./agents/performance.js";
-import { auditPlan, rootCauseAnalysis } from "./core/self_correct.js";
-import { confidenceGate }          from "./core/uncertainty.js";
-import { recall }                  from "./memory/vectorstore.js";
-import { getRelevantFacts }        from "./memory/knowledge_graph.js";
-import { getContextString }        from "./memory/preferences.js";
-import { AGENT }                   from "./config.js";
+// orchestrator.js — Master Orchestrator (minimax-m2.7:cloud)
+import { MODELS, WORKING_DIR, AGENT }      from "./config.js";
+import { TOOLS_ALL, EXECUTORS }            from "./tools/index.js";
+import { callOllama }                      from "./agents/base.js";
+import { analyze  as visionRun }           from "./agents/vision.js";
+import { code     as coderRun }            from "./agents/coder.js";
+import { reason   as logicRun }            from "./agents/logic.js";
+import { audit    as securityRun }         from "./agents/security.js";
+import { analyze  as perfRun }             from "./agents/performance.js";
+import { auditPlan, rootCauseAnalysis }    from "./core/self_correct.js";
+import { confidenceGate }                  from "./core/uncertainty.js";
+import { parseTextToolCalls }              from "./core/tool_parser.js";
+import { recall }                          from "./memory/vectorstore.js";
+import { getRelevantFacts }                from "./memory/knowledge_graph.js";
+import { getContextString }                from "./memory/preferences.js";
 
-// ── Delegation tool definitions (Orchestrator-only) ──
 const DELEGATION_TOOLS = [
   {
     type: "function",
     function: {
       name: "delegate_vision",
-      description:
-        "Send a visual perception task to the Vision Agent (qwen3-vl:235b). Screenshots are GPU-compressed (RTX 3050) before cloud analysis. Use for: finding GUI coordinates, reading screen text, detecting UI state, analyzing screenshots.",
-      parameters: {
-        type: "object",
-        properties: {
-          task:           { type: "string", description: "What to analyze or find visually" },
-          context:        { type: "string", description: "Relevant context from previous steps" },
-          screenshotPath: { type: "string", description: "Path to existing screenshot (optional)" },
-        },
-        required: ["task"],
-      },
+      description: "Send visual/GUI task to Vision Agent (qwen3-vl). Use for: screenshots, click coordinates, reading screen text.",
+      parameters: { type: "object", properties: { task: { type: "string" }, context: { type: "string" }, screenshotPath: { type: "string" } }, required: ["task"] },
     },
   },
   {
     type: "function",
     function: {
       name: "delegate_coder",
-      description:
-        "Send a coding task to the Coder Agent (qwen3-coder:480b). For complex tasks it auto-triggers adversarial debate with Logic agent. Use for: writing scripts, debugging, implementing features, web scraping, installing packages.",
-      parameters: {
-        type: "object",
-        properties: {
-          task:       { type: "string", description: "What to code or fix" },
-          context:    { type: "string", description: "Existing code, error messages, file paths" },
-          useDebate:  { type: "boolean", description: "Force adversarial debate with Logic agent" },
-        },
-        required: ["task"],
-      },
+      description: "Send coding task to Coder Agent (qwen3-coder:480b). Use for: writing scripts, fixing bugs, building scrapers, running code.",
+      parameters: { type: "object", properties: { task: { type: "string" }, context: { type: "string" }, useDebate: { type: "boolean" } }, required: ["task"] },
     },
   },
   {
     type: "function",
     function: {
       name: "delegate_logic",
-      description:
-        "Send a deep reasoning task to the Logic Agent (deepseek-v3.1:671b). Use for: research, root-cause analysis, hard debugging, CAPTCHA bypasses, architectural decisions, analyzing large logs.",
-      parameters: {
-        type: "object",
-        properties: {
-          task:    { type: "string", description: "Problem to reason through" },
-          context: { type: "string", description: "Relevant logs, errors, background info" },
-        },
-        required: ["task"],
-      },
+      description: "Send hard reasoning task to Logic Agent (deepseek-v3.1:671b). Use for: research, root-cause analysis, debugging errors.",
+      parameters: { type: "object", properties: { task: { type: "string" }, context: { type: "string" } }, required: ["task"] },
     },
   },
   {
     type: "function",
     function: {
       name: "delegate_security",
-      description:
-        "Run a security audit with the Security Agent. Use for: XSS/injection scanning, checking for hardcoded secrets, auth flaws, OWASP Top 10.",
-      parameters: {
-        type: "object",
-        properties: {
-          task:        { type: "string" },
-          codeOrPath:  { type: "string", description: "Code string or file path to audit" },
-        },
-        required: ["task"],
-      },
+      description: "Run security audit. Use for: XSS/injection scanning, hardcoded secrets, OWASP checks.",
+      parameters: { type: "object", properties: { task: { type: "string" }, codeOrPath: { type: "string" } }, required: ["task"] },
     },
   },
   {
     type: "function",
     function: {
       name: "delegate_performance",
-      description:
-        "Run a performance audit with the Performance Agent. Use for: profiling CPU/memory, finding bottlenecks, optimizing database queries, reducing latency.",
-      parameters: {
-        type: "object",
-        properties: {
-          task:       { type: "string" },
-          codeOrPath: { type: "string", description: "Code or file path to profile" },
-        },
-        required: ["task"],
-      },
+      description: "Run performance audit. Use for: CPU/memory profiling, query optimization, bottlenecks.",
+      parameters: { type: "object", properties: { task: { type: "string" }, codeOrPath: { type: "string" } }, required: ["task"] },
     },
   },
   {
     type: "function",
     function: {
       name: "audit_plan",
-      description:
-        "BEFORE executing a complex or risky plan, run it through the self-correction auditor. Returns concerns, failure points, mitigations, and an improved plan.",
-      parameters: {
-        type: "object",
-        properties: {
-          plan:    { type: "string", description: "The plan to audit" },
-          context: { type: "string", description: "Relevant context" },
-        },
-        required: ["plan"],
-      },
+      description: "Run self-correction auditor on a plan BEFORE executing risky multi-step operations.",
+      parameters: { type: "object", properties: { plan: { type: "string" }, context: { type: "string" } }, required: ["plan"] },
     },
   },
   {
     type: "function",
     function: {
       name: "ask_user",
-      description:
-        "Pause and ask the human a question. Use ONLY for: ambiguous intent, destructive/irreversible actions, missing credentials, or low confidence (< 70%).",
-      parameters: {
-        type: "object",
-        properties: {
-          question: { type: "string" },
-        },
-        required: ["question"],
-      },
+      description: "Ask the human a question. Use ONLY for destructive/irreversible actions or truly missing info.",
+      parameters: { type: "object", properties: { question: { type: "string" } }, required: ["question"] },
     },
   },
 ];
 
-const ORCHESTRATOR_TOOLS = [...TOOLS_ALL, ...DELEGATION_TOOLS];
+const ALL_TOOLS = [...TOOLS_ALL, ...DELEGATION_TOOLS];
 
 function buildSystemPrompt(memories, knowledge, prefs) {
-  return `You are the PRIMARY ORCHESTRATOR of an advanced autonomous AI system.
-You run on: i7-13th Gen | RTX 3050 4GB | 16GB DDR5 | Windows 11/WSL2.
+  const memCtx = memories.length
+    ? "\n[Relevant Past Experience]\n" + memories.map(m => "- " + m.text).join("\n")
+    : "";
 
-## Your Specialized Team
-- delegate_vision      → Vision Agent (qwen3-vl)         — Screen analysis, GUI coordinates, OCR
-- delegate_coder       → Coder Agent (qwen3-coder:480b)  — Write/debug/run code (auto-debates for complex tasks)
-- delegate_logic       → Logic Agent (deepseek:671b)     — Deep research, RCA, hard reasoning
-- delegate_security    → Security Agent                   — XSS/injection/OWASP audits
-- delegate_performance → Performance Agent                — CPU/memory/latency profiling
-- audit_plan           → Self-Correction Auditor          — Review your plan before risky execution
+  return `You are an autonomous AI agent on Windows 11. Execute tasks immediately using tools.
 
-## Your Own Tools
-execute_bash, execute_bash_parallel, read_file, write_file, patch_file, list_directory,
-web_search, fetch_url, call_api, take_screenshot, mouse_click, mouse_move, mouse_scroll,
-keyboard_type, save_progress, recall_memory, learn_fact, query_knowledge
+CRITICAL RULES:
+1. CALL TOOLS IMMEDIATELY. Never describe what you will do — just do it.
+2. After every tool result, call the next tool right away.
+3. When creating files (Word docs, CSVs, reports), ALWAYS tell the user the full save path at the end.
+4. ask_user ONLY for: rm -rf, deleting important data, sending emails/messages.
+5. When task is done, summarize: what was done + where output files are saved.
 
-## Hardware Advantages
-- Use execute_bash_parallel for independent commands (runs on i7 P-cores simultaneously)
-- Screenshots are auto GPU-compressed (RTX 3050) — no need to manually resize
-- Memory is vector-indexed in 16GB DDR5 RAM — use recall_memory before re-researching
+TOOLS YOU MUST USE (call them, don't describe them):
+execute_bash, execute_bash_parallel, read_file, write_file, patch_file,
+list_directory, web_search, fetch_url, call_api,
+take_screenshot, mouse_click, keyboard_type,
+save_progress, recall_memory, learn_fact, query_knowledge,
+delegate_vision, delegate_coder, delegate_logic,
+delegate_security, delegate_performance, audit_plan
 
-## ReAct Protocol
-THOUGHT: [Your reasoning — be explicit]
-ACTION: [Tool to call or FINAL_ANSWER]
-
-For every complex task:
-1. THOUGHT: Decompose the goal into a sequential plan
-2. Call audit_plan on risky or multi-step plans
-3. Execute steps, using the right agent for each
-4. VERIFY each step completed correctly before the next
-5. Use recall_memory to avoid re-doing work
-
-## Memory & Knowledge
-${memories.length ? `\n[Relevant Past Experience]\n${memories.map(m => `- ${m.text}`).join("\n")}` : "No relevant past experience yet."}
-${knowledge || ""}
-
-## User Preferences
-${prefs}
-
-## Safety Rules
-- Use ask_user before: rm -rf, force-push, sending emails, irreversible changes
-- Confidence < 70% on a task → ask_user
-- Always verify destructive operations before execution
-
-Working directory: ${WORKING_DIR}`;
+Hardware: i7-13th Gen | RTX 3050 4GB | 16GB DDR5 | Windows 11
+Working directory: ${WORKING_DIR}
+${memCtx}${knowledge ? "\n" + knowledge : ""}${prefs ? "\nUser preferences:\n" + prefs : ""}`;
 }
 
-// ── Main Orchestrator Run ────────────────────────────
 export async function runOrchestrator({ userMessage, history, rl, C, log }) {
-  // Load relevant context
   const [memories, knowledge, prefs] = await Promise.all([
     recall(userMessage, 4),
     Promise.resolve(getRelevantFacts(userMessage)),
@@ -199,164 +111,173 @@ export async function runOrchestrator({ userMessage, history, rl, C, log }) {
 
   const sysPrompt = buildSystemPrompt(memories, knowledge, prefs);
 
-  history.push({ role: "user", content: userMessage });
-
   const messages = [
     { role: "system", content: sysPrompt },
     ...history,
+    { role: "user", content: userMessage },
   ];
+  history.push({ role: "user", content: userMessage });
 
   let delegations = 0;
+  let textOnlyTurns = 0; // track consecutive turns with no tool calls
 
   for (let turn = 0; turn < AGENT.maxIterations; turn++) {
-    log(`\n[Orchestrator | Turn ${turn + 1}]`, C.blue, "");
+    log("\n[Orchestrator | Turn " + (turn + 1) + "]", C.blue, "");
 
     let response;
     try {
-      response = await callOllama(MODELS.orchestrator, messages, ORCHESTRATOR_TOOLS);
+      response = await callOllama(MODELS.orchestrator, messages, ALL_TOOLS);
     } catch (err) {
       log("✗ Orchestrator:", C.red, err.message);
       log("  → Is Ollama running? Try: ollama serve", C.yellow);
       return;
     }
 
-    const msg = response.choices?.[0]?.message;
+    const msg = response.message;
     if (!msg) { log("✗ Empty response", C.red); break; }
 
-    messages.push(msg);
-    history.push(msg);
+    // Show thinking if available
+    if (msg.thinking) {
+      log("  💭", C.gray, msg.thinking.slice(0, 200));
+    }
 
-    // Print thought + text
-    if (msg.content?.trim()) {
-      const thought = msg.content.match(/THOUGHT:\s*([\s\S]+?)(?=ACTION:|$)/i)?.[1]?.trim();
-      if (thought) log(`  💭`, C.gray, thought.slice(0, 180));
+    const assistantMsg = { role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls };
+    messages.push(assistantMsg);
+    history.push(assistantMsg);
 
-      const isAnswer = msg.content.includes("FINAL_ANSWER") || !msg.tool_calls?.length;
-      if (isAnswer) {
-        log("\n🤖 Orchestrator:", C.green, "");
-        const answer = msg.content.replace(/THOUGHT:[\s\S]+?(?=ANSWER:|$)/i, "").replace(/ACTION:\s*FINAL_ANSWER/i, "").replace(/ANSWER:/i, "").trim();
-        console.log(`\x1b[37m${answer || msg.content}\x1b[0m`);
+    // Get tool calls — native first, then text fallback
+    let toolCalls = msg.tool_calls || [];
+
+    if (!toolCalls.length && msg.content) {
+      const parsed = parseTextToolCalls(msg.content);
+      if (parsed.length) {
+        log("  ⚡ Parsed " + parsed.length + " tool call(s) from text", C.yellow);
+        toolCalls = parsed;
       }
     }
 
-    const toolCalls = msg.tool_calls;
-    if (!toolCalls?.length) break;
+    // Print text content
+    if (msg.content?.trim() && !toolCalls.length) {
+      log("\n🤖 Orchestrator:", C.green, "");
+      console.log("\x1b[37m" + msg.content + "\x1b[0m");
+    }
+
+    // If no tool calls and model just talked → nudge it to act
+    if (!toolCalls.length) {
+      textOnlyTurns++;
+      if (textOnlyTurns >= 2) {
+        log("  ⚠ Model not calling tools. Nudging...", C.yellow);
+        break;
+      }
+      // Push a nudge message
+      messages.push({
+        role:    "user",
+        content: "Execute the task now. Call the appropriate tools immediately. Do not describe — just call tools.",
+      });
+      continue;
+    }
+
+    textOnlyTurns = 0;
 
     // Execute all tool calls
     for (const tc of toolCalls) {
-      let args = {};
-      try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+      const name = tc.function?.name;
+      let args = tc.function?.arguments || {};
+      if (typeof args === "string") {
+        try { args = JSON.parse(args); } catch { args = {}; }
+      }
 
-      const name = tc.function.name;
       let result;
 
       try {
         switch (name) {
           case "delegate_vision":
             delegations++;
-            log(`\n  → Delegating to 👁 Vision`, C.magenta, args.task?.slice(0, 60));
+            log("\n  → 👁 Vision", C.magenta, (args.task || "").slice(0, 70));
             result = await visionRun({ ...args, rl, C, log });
             break;
 
           case "delegate_coder":
             delegations++;
-            log(`\n  → Delegating to 💻 Coder`, C.cyan, args.task?.slice(0, 60));
+            log("\n  → 💻 Coder", C.cyan, (args.task || "").slice(0, 70));
             result = await coderRun({ ...args, rl, C, log });
             break;
 
           case "delegate_logic":
             delegations++;
-            log(`\n  → Delegating to 🧠 Logic`, C.magenta, args.task?.slice(0, 60));
+            log("\n  → 🧠 Logic", C.magenta, (args.task || "").slice(0, 70));
             result = await logicRun({ ...args, rl, C, log });
             break;
 
           case "delegate_security":
             delegations++;
-            log(`\n  → Delegating to 🔒 Security`, C.red, args.task?.slice(0, 60));
+            log("\n  → 🔒 Security", C.red, (args.task || "").slice(0, 70));
             result = await securityRun({ ...args, rl, C, log });
             break;
 
           case "delegate_performance":
             delegations++;
-            log(`\n  → Delegating to ⚡ Performance`, C.yellow, args.task?.slice(0, 60));
+            log("\n  → ⚡ Performance", C.yellow, (args.task || "").slice(0, 70));
             result = await perfRun({ ...args, rl, C, log });
             break;
 
           case "audit_plan":
-            log(`\n  → 🔍 Auditing plan (self-correction)`, C.blue);
+            log("\n  → 🔍 Auditing plan", C.blue);
             result = await auditPlan(args);
-            if (!result.approved) {
-              log(`  ⚠ Plan concerns:`, C.yellow, result.concerns.join(", "));
-            }
+            if (!result.approved) log("  ⚠ Concerns:", C.yellow, (result.concerns || []).join(", "));
             break;
 
           case "ask_user": {
-            const gate = await confidenceGate({
-              action: args.question,
-              task:   userMessage,
-              rl, log, C,
-            });
+            const gate = await confidenceGate({ action: args.question, toolName: "ask_user", task: userMessage, rl, log, C });
             if (!gate.proceed) {
               result = { answer: "User declined", cancelled: true };
             } else {
-              log(`\n❓`, C.magenta, args.question);
-              const answer = await new Promise(r =>
-                rl.question(`\x1b[36mYour answer: \x1b[0m`, r)
-              );
+              log("\n❓", C.magenta, args.question);
+              const answer = await new Promise(r => rl.question("\x1b[36mYour answer: \x1b[0m", r));
               result = { answer };
             }
             break;
           }
 
           default: {
-            // Regular tool
-            log(`  ⚙ [${name}]`, C.yellow, JSON.stringify(args).slice(0, 100));
-
-            // Confidence gate for destructive actions
-            const gate = await confidenceGate({
-              action: `${name}: ${JSON.stringify(args)}`,
-              task:   userMessage,
-              rl, log, C,
-            });
-
+            log("  ⚙ [" + name + "]", C.yellow, JSON.stringify(args).slice(0, 100));
+            const gate = await confidenceGate({ action: JSON.stringify(args), toolName: name, task: userMessage, rl, log, C });
             if (!gate.proceed) {
               result = { cancelled: true, reason: gate.reason };
             } else {
               const fn = EXECUTORS[name];
               result = fn
                 ? await fn(args).catch(e => ({ error: e.message }))
-                : { error: `Unknown tool: ${name}` };
+                : { error: "Unknown tool: " + name };
 
-              // Auto RCA on failures
-              if ((result?.exit_code > 0 || result?.error) && AGENT.rcaEnabled) {
-                log(`  🔍 Auto RCA triggered`, C.yellow);
+              if (AGENT.rcaEnabled && (result?.exit_code > 0 || result?.error)) {
+                log("  🔍 RCA triggered", C.yellow);
                 const rca = await rootCauseAnalysis({
-                  tool:    name,
-                  command: JSON.stringify(args),
-                  error:   result.stderr || result.error || "",
+                  tool: name, command: JSON.stringify(args),
+                  error: result.stderr || result.error || "",
                 });
                 result._rca = rca;
-                log(`  💡 RCA:`, C.cyan, rca.fix);
+                log("  💡 Fix:", C.cyan, rca.fix);
               }
             }
-            console.log(`\x1b[90m  ✓ ${JSON.stringify(result).slice(0, 200)}\x1b[0m`);
+            console.log("\x1b[90m  ✓ " + JSON.stringify(result).slice(0, 200) + "\x1b[0m");
           }
         }
       } catch (err) {
         result = { error: err.message };
-        log(`  ✗ ${name} threw:`, C.red, err.message);
+        log("  ✗ " + name + ":", C.red, err.message);
       }
 
+      // Ollama native tool result format
       messages.push({
-        role:         "tool",
-        tool_call_id: tc.id,
-        name,
-        content:      typeof result === "string" ? result : JSON.stringify(result),
+        role:      "tool",
+        tool_name: name,
+        content:   typeof result === "string" ? result : JSON.stringify(result),
       });
     }
 
     if (delegations >= AGENT.maxDelegations) {
-      log("⚠ Max sub-agent delegations reached.", C.yellow);
+      log("⚠ Max delegations reached.", C.yellow);
     }
   }
 }

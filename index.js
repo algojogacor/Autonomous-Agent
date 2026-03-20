@@ -17,6 +17,8 @@
  */
 
 import readline from "readline";
+import path from "path";
+import { createWriteStream } from "fs";
 import { MODELS, OLLAMA_URL, WORKING_DIR, HARDWARE } from "./config.js";
 import { runOrchestrator } from "./orchestrator.js";
 import { status as gpuStatus } from "./hardware/gpu.js";

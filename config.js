@@ -42,11 +42,11 @@ export const HARDWARE = {
 
 // ── Agent Behaviour ──────────────────────────────────────────
 export const AGENT = {
-  maxIterations:      40,   // Max tool-call turns per agent
-  maxDelegations:     15,   // Max sub-agent calls per orchestrator run
-  maxDebateRounds:    3,    // Coder vs Logic adversarial debate rounds
-  bashTimeout:        60000,
-  fetchTimeout:       15000,
+  maxIterations:      60,    // Max tool-call turns per agent
+  maxDelegations:     20,    // Max sub-agent calls per orchestrator run
+  maxDebateRounds:    3,     // Coder vs Logic adversarial debate rounds
+  bashTimeout:        120000, // 2 min — allow long-running scripts
+  fetchTimeout:       30000,  // 30s for slow pages
 
   // Self-correction
   maxRetries:         3,    // Auto-retry on tool failure

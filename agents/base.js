@@ -1,40 +1,46 @@
-// agents/base.js — Shared Agent Engine
-import { OLLAMA_URL, AGENT } from "../config.js";
+// agents/base.js — Ollama Native Client
+import { Ollama } from "ollama";
+import { OLLAMA_URL } from "../config.js";
 
-/**
- * Call Ollama's OpenAI-compatible chat completions API.
- */
-export async function callOllama(model, messages, tools = []) {
-  const url  = `${OLLAMA_URL}/v1/chat/completions`;
-  const body = {
-    model,
-    messages,
-    max_tokens: AGENT.maxIterations * 200,
-    stream:     false,
-    ...(tools.length ? { tools, tool_choice: "auto" } : {}),
-  };
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
 
-  const res = await fetch(url, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify(body),
-    signal:  AbortSignal.timeout(120_000),
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Ollama [${model}] HTTP ${res.status}: ${err.slice(0, 300)}`);
-  }
-  return res.json();
+let _client;
+function getClient() {
+  if (!_client) _client = new Ollama({ host: OLLAMA_URL });
+  return _client;
 }
 
-/**
- * Simple one-shot call (no tool loop). Good for classification, scoring, JSON tasks.
- */
+export async function callOllama(model, messages, tools = []) {
+  const client = getClient();
+
+  const opts = {
+    model,
+    messages,
+    stream: false,
+    // think:true disabled when tools present — causes model to exhaust tokens on reasoning
+    // and produce no tool_calls. Only enable for pure reasoning (no tools).
+    think: tools.length === 0,
+    options: {
+      num_ctx:     32768,  // Large context — no output length restriction
+      temperature: 0.2,
+      // NO num_predict limit — let model output as much as it needs
+    },
+  };
+
+  if (tools.length) opts.tools = tools;
+  if (OLLAMA_API_KEY) opts.options.web_search = true;
+
+  try {
+    return await client.chat(opts);
+  } catch (err) {
+    throw new Error(`Ollama [${model}]: ${err.message}`);
+  }
+}
+
 export async function oneShot(model, systemPrompt, userPrompt) {
   const resp = await callOllama(model, [
     { role: "system", content: systemPrompt },
-    { role: "user",   content: userPrompt },
+    { role: "user",   content: userPrompt   },
   ]);
-  return resp.choices?.[0]?.message?.content || "";
+  return resp.message?.content || "";
 }

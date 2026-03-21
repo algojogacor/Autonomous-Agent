@@ -1,3 +1,26 @@
-node_modules/
+# ── Environment & Secrets ────────────────────────
 .env
-*.log
+*.env
+.env.local
+.env.production
+
+# ── Agent Runtime Files ──────────────────────────
+.agent_state.json
+.agent_memory.json
+.agent_knowledge.json
+.agent_preferences.json
+agent_log_*.txt
+
+# ── Node.js ──────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-error.log
+
+# ── OS ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Screenshots & Temp ───────────────────────────
+agent_screen_*.png
+agent_crop_*.jpg
